@@ -1,0 +1,7 @@
+# Ignore virtual environment
+treat-api/
+
+# Ignore __pycache__ folders
+__pycache__/
+
+huggingface_api_key.txt
