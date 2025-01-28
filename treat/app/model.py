@@ -2,45 +2,66 @@ import re
 import time
 import logging
 import requests
+from typing import Dict, List, Union
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 API_KEY_FILE = "huggingface_api_key.txt"
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-API_URL = f"https://api-inference.huggingface.co/models/{MODEL_NAME}"  # Corrected URL
+API_URL = f"https://api-inference.huggingface.co/models/{MODEL_NAME}"
 
-def load_api_key():
+class APIError(Exception):
+    """Custom exception for API-related errors"""
+    pass
+
+def load_api_key() -> str:
     try:
         with open(API_KEY_FILE, "r") as f:
             return f.read().strip()
     except FileNotFoundError:
-        raise Exception(f"API key file {API_KEY_FILE} not found")
+        raise APIError(f"API key file {API_KEY_FILE} not found")
 
 HEADERS = {
     "Authorization": f"Bearer {load_api_key()}",
     "Content-Type": "application/json"
 }
 
-def query_inference_api(payload):
-    retries = 3
-    for _ in range(retries):
-        response = requests.post(API_URL, headers=HEADERS, json=payload)
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=4, max=30),
+    retry=retry_if_exception_type((requests.exceptions.RequestException, APIError)),
+    before_sleep=lambda retry_state: logger.warning(
+        f"Attempt {retry_state.attempt_number} failed, retrying in {retry_state.next_action.sleep} seconds..."
+    )
+)
+def query_inference_api(payload: Dict) -> Dict:
+    try:
+        response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=90)
         
         if response.status_code == 200:
             return response.json()
         elif response.status_code == 503:  # Model not loaded
             result = response.json()
-            wait_time = result.get('estimated_time', 10)
-            logger.warning(f"Model loading, retrying in {wait_time:.1f}s")
+            wait_time = min(result.get('estimated_time', 10), 30)  # Cap wait time at 30s
+            logger.warning(f"Model loading, waiting {wait_time:.1f}s")
             time.sleep(wait_time)
+            raise APIError("Model still loading")
         else:
-            raise Exception(f"API Error {response.status_code}: {response.text}")
+            raise APIError(f"API Error {response.status_code}: {response.text}")
     
-    raise Exception("Failed to get valid response after retries")
+    except requests.exceptions.Timeout:
+        raise APIError("Request timed out - model may be too busy")
+    except requests.exceptions.RequestException as e:
+        raise APIError(f"Request failed: {str(e)}")
 
-def extract_answers(raw_answer, expected_order):
+def extract_answers(raw_answer: str, expected_order: List[str]) -> List[str]:
     answer_dict = {}
+    
+    # Convert raw answer to uppercase for consistent matching
+    raw_answer = raw_answer.upper()
+    
     for category in expected_order:
         patterns = [
             rf"{category}[\s:]*\[?(YES|NO|MAYBE|Y|N|M)\]?",
@@ -55,16 +76,17 @@ def extract_answers(raw_answer, expected_order):
                 answer_dict[category] = answer
                 break
         else:
-            answer_dict[category] = "NO"
+            answer_dict[category] = "NO"  # Default to NO if no match found
     
     return [answer_dict[cat] for cat in expected_order]
 
-def analyze_script(script):
+def analyze_script(script: str) -> Dict[str, Union[int, str]]:
     logger.info("Starting Analysis")
     start_time = time.time()
     
     try:
-        max_chunk_size = 2048
+        # Reduced chunk size to help with timeouts
+        max_chunk_size = 1024
         chunks = [script[i:i+max_chunk_size] for i in range(0, len(script), max_chunk_size)]
         
         expected_order = [
@@ -78,20 +100,18 @@ def analyze_script(script):
         for chunk_idx, chunk in enumerate(chunks, 1):
             logger.info(f"Processing chunk {chunk_idx}/{len(chunks)}")
             
-            prompt = f"""Comprehensive Sensitive Content Analysis Protocol
+            prompt = f"""Analyze the following text for sensitive content, responding only with category labels and YES/NO/MAYBE:
 
-[Your original prompt here...]
 {chunk}
 
-RESPONSE FORMAT:
-[Your original format here...]"""
+Format: CATEGORY: YES/NO/MAYBE"""
 
             payload = {
                 "inputs": prompt,
                 "parameters": {
-                    "temperature": 0.2,
+                    "temperature": 0.1,  # Reduced temperature for more consistent results
                     "top_p": 0.9,
-                    "max_new_tokens": 1024,
+                    "max_new_tokens": 512,  # Reduced token limit
                     "return_full_text": False
                 }
             }
@@ -104,8 +124,8 @@ RESPONSE FORMAT:
             else:
                 raw_answer = result.get('generated_text', '')
             
-            logger.info("[Model Raw Response]")
-            logger.info(raw_answer)
+            logger.debug("[Model Raw Response]")
+            logger.debug(raw_answer)
             
             answers = extract_answers(raw_answer, expected_order)
             
@@ -126,8 +146,8 @@ RESPONSE FORMAT:
         return identified
     
     except Exception as e:
-        logger.error(f"Analysis error: {e}")
+        logger.error(f"Analysis error: {str(e)}")
         return {"error": str(e)}
 
-def get_detailed_analysis(script):
+def get_detailed_analysis(script: str) -> Dict[str, Union[int, str]]:
     return analyze_script(script)
